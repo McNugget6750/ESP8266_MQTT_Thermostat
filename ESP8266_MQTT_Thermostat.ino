@@ -1,4 +1,5 @@
 #include <ESP8266WiFi.h>
+#include <PubSubClient.h>
 #include <stdio.h>
 #include <time.h>
 #include "Wire.h"
@@ -40,10 +41,24 @@ float currentVoltage = 0, lastVoltage = 0;
  * WIFI Configuration and variables
  */
 
-const char* ssid = "wifi";
-const char* password = "password";
+const char* ssid = "mainWIFI";
+const char* password = "mainWifiPWD";
+const char* ssidMQTT = "mqttWifi";
+const char* passwordMQTT = "mqttPWD";
 int timezone = -8;
 int dst = 0;
+
+/*
+ * MQTT Configuration and Variables
+ */
+
+const char* mqtt_server = "10.10.10.1";
+WiFiClient espClient;
+PubSubClient client(espClient);
+unsigned long lastMsg = 0;
+#define MSG_BUFFER_SIZE  (50)
+char msg[MSG_BUFFER_SIZE];
+int value = 0;
 
 void setup(void) 
 {
@@ -71,16 +86,16 @@ void setup(void)
   }*/
   
 /********************************************************************/
-// Connect to WiFi
+// Connect to WiFi for NTP time query
   addLine2Console(String("Initializing WiFi..."));
   WiFi.mode(WIFI_STA);
-  addLine2Console(String("Setting user & passwd..."));
+  addLine2Console(String("Setting user&passwd..."));
   WiFi.begin(ssid, password);
   Serial.println("\nConnecting to WiFi");
   addLine2Console(String("Connecting..."));
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print(".");
-    addLine2Console(String("waiting..."));
+    addLine2Console(String("  waiting for WiFi..."));
     delay(1000);
   }
   addLine2Console(String("Connected!"));
@@ -90,27 +105,73 @@ void setup(void)
 // Connect NTP Server to Update Internal Time
   addLine2Console(String("Query time server..."));
   configTime(timezone * 3600, 0, "pool.ntp.org", "time.nist.gov");
-  Serial.println("\nWaiting for time");
-  addLine2Console(String("Waiting for time"));
+  Serial.println("\nWaiting for time.");
+  addLine2Console(String("Waiting for time."));
   while (!time(nullptr)) {
     Serial.print(".");
-    addLine2Console(String("waiting..."));  
+    addLine2Console(String("Wait for time updt."));  
     delay(1000);
   }
   Serial.println("Time and date updated.");
-  addLine2Console(String("Time updated."));
-  delay(2000); // Let the time settle. It seems it takes a certain amount of seconds to propergate
+  addLine2Console(String("Connected to NTP."));
   
   struct     tm *ts;
   char       buf[80];
   // Print the current time to the display
   time_t now = time(nullptr);
-  ts = localtime(&now);
-  strftime(buf, 80, "%T", ts);
-  addLine2Console(String(buf));
-  addLine2Console(String("  "));
+  
+  // Connecting to the NTP server does not provide a valid time.
+  // Time is updated when the server
+  uint8_t numNTPTries = 0;
+  while (now <= 1500000000)
+  {
+    addLine2Console(String("Validing time..."));
+    ts = localtime(&now);
+    strftime(buf, 80, "%T", ts);
+    addLine2Console(String("  ") + String(buf));
+    strftime(buf, 80, "%F", ts);
+    addLine2Console(String("  ") + String(buf));
+    delay(1000);
+    now = time(nullptr); // Update after waiting for a second
+
+    if (numNTPTries > 20)
+    {
+      Serial.println("Could not connect to time server. Aborting time acquisition");
+      addLine2Console(String("Could not get time."));
+      break; // kill while loop and go on.
+    }
+    numNTPTries++;
+  }
+
+  if (numNTPTries < 10)
+  {
+    addLine2Console(String("  "));
+    addLine2Console(String("Time received:"));
+    ts = localtime(&now);
+    strftime(buf, 80, "%T", ts);
+    addLine2Console(String("   ") + String(buf));
+    strftime(buf, 80, "%F", ts);
+    addLine2Console(String("   ") + String(buf));
+    addLine2Console(String("  "));
+  }
   delay(2000);
   
+/********************************************************************/
+// Connect to WiFi for MQTT network
+  addLine2Console(String("Init MQTT WiFi..."));
+  WiFi.mode(WIFI_STA);
+  addLine2Console(String("Setting user&passwd..."));
+  WiFi.begin(ssidMQTT, passwordMQTT);
+  Serial.println("\nConnecting to MQTT WiFi");
+  addLine2Console(String("Connecting..."));
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    addLine2Console(String("  waiting for WiFi..."));
+    delay(1000);
+  }
+  addLine2Console(String("Connected to MQTT!"));
+  addLine2Console(String("  "));
+
 /**********************************************************************/
   addLine2Console(String("I2C Scanner:"));
 // System check for sensors
@@ -186,27 +247,34 @@ void setup(void)
   lastPressure = currentPressure;
   lastHumidity = currentHumidity;
 
+//*************************************************************************
+// Attempt to connect to MQTT network
+  addLine2Console(String("Connecting to MQTT."));
+  client.setServer(mqtt_server, 1883);
+  addLine2Console(String("MQTT Server set."));
+
   delay(3000);
   tft.fillScreen(ST7735_BLACK); // Reset the screen memory to a black background
   drawGraphBox();
 }
- 
+
 void loop()
 {
+  static uint32_t lastMillis = millis();
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop();
+  
   struct     tm *ts;
   char       buf[26];
   // Print the current time to the display
-  time_t now = time(nullptr);
+  time_t now = time(nullptr); // Not sure if this is enough to update the time from the NTP server as well
   Serial.print(ctime(&now));
   //Serial.println(now % 86400); // Number of seconds since midnight
   /* Format and print the time, "ddd yyyy-mm-dd hh:mm:ss zzz" */
   ts = localtime(&now);
-  
   strftime(buf, 26, "%r", ts);
-  String h = ts->tm_hour < 10 ? (String("0") + String(ts->tm_hour)) : String(ts->tm_hour);
-  String m = ts->tm_min < 10 ? (String("0") + String(ts->tm_min)) : String(ts->tm_min);
-  //display_DrawTopStatusBar(true, WiFi.RSSI(), h + String(":") + m); // Draw the initial status bar.
-
   // Refresh the graph at 00:00:00 (hh:mm:ss) also known as Midnight
   if (ts->tm_hour == 0 && ts->tm_min == 0 && ts->tm_sec == 0)
     drawGraphBox();
@@ -230,14 +298,44 @@ void loop()
   drawHumidityGraph(currentHumidity, now % 86400);
   drawPressureGraph(currentPressure, now % 86400);
   drawTemperatureGraph(currentTempC, now % 86400);
-  
-  lastTempC = currentTempC;
-  lastTempF = currentTempF;
-  lastPressure = currentPressure;
-  lastHumidity = currentHumidity;
 
+  if (client.connected())
+  {
+    client.publish("elBote/LivingRoom/Temperature", String(currentTempC).c_str());
+    client.publish("elBote/LivingRoom/Pressure", String(currentPressure).c_str());
+    client.publish("elBote/LivingRoom/Humidity", String(currentHumidity).c_str());
+
+    if (millis() - lastMillis >= 86400) // 1000 samples per day in the graph display
+    {
+      client.publish("elBote/LivingRoom/TemperatureGraph", String(currentTempC).c_str());
+      client.publish("elBote/LivingRoom/PressureGraph", String(currentPressure).c_str());
+      client.publish("elBote/LivingRoom/HumidityGraph", String(currentHumidity).c_str());
+      lastMillis = millis();
+    }
+  }
 
   delay(1000); //just here to slow down the output
+}
+
+void reconnectMQTT() {
+  // Loop until we're reconnected
+  if (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Create a random client ID
+    String clientId = "ESP8266Client-";
+    clientId += String(random(0xffff), HEX);
+    // Attempt to connect
+    if (client.connect(clientId.c_str())) {
+      Serial.println("connected");
+      // Once connected, publish an announcement...
+      client.publish("outTopic", "Living Room Connected!");
+      // ... and resubscribe
+      client.subscribe("inTopic");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+    }
+  }
 }
 
 void display_UpdateSensorValues(void)
@@ -311,8 +409,8 @@ void drawGraphBox(void)
   tft.drawPixel(0, 102, ST7735_WHITE);
   tft.drawPixel(4, 102, ST7735_WHITE);
 
-  tft.drawFastVLine(32, 100, 57, TFT_DARKGREY); // 6am marker
-  tft.drawFastVLine(64, 100, 57, TFT_LIGHTGREY); // 12PM marker
+  tft.drawFastVLine(34, 100, 57, TFT_DARKGREY); // 6am marker
+  tft.drawFastVLine(65, 100, 57, TFT_LIGHTGREY); // 12PM marker
   tft.drawFastVLine(96, 100, 57, TFT_DARKGREY); // 6PM marker
 
   display_PrintText("6am", 23, 92, 1, ST7735_DARKGREY);
@@ -372,7 +470,7 @@ void addLine2Console(String line)
     display_PrintTextAdv(consoleBuffer[head], 0, 152 - 8 * i, 1, 1, ST7735_WHITE, ST7735_BLACK);
     head--;
     if (head == 255)
-      head = NUM_CONSOLE_LINES;
+      head = NUM_CONSOLE_LINES - 1;
   }
 }
 
